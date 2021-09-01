@@ -84,7 +84,7 @@ func (r *RedisMemoLock) dispatch() {
 							newList = append(newList, x)
 						}
 					}
-					for i := len(newList); i < len(list); i++ {
+					for i := len(newList); i < len(list) && i < cap(newList); i++ {
 						newList[i] = nil
 					}
 				}
