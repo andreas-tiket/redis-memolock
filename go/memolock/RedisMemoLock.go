@@ -244,8 +244,9 @@ func (r *RedisMemoLock) getResourceImpl(ctx context.Context, resID string, gener
 	// If the resource is available, return it immediately.
 	res, err := r.client.Get(ctx, resourceID).Result()
 	if err != redis.Nil { // key is not missing
-		if err != nil { // real error happened?
-			return "", err
+		if err != nil { // real error happened? run manual
+			res, _, err = generatingFunc()
+			return res, err
 		}
 		return res, nil
 	}
@@ -254,7 +255,8 @@ func (r *RedisMemoLock) getResourceImpl(ctx context.Context, resID string, gener
 	// The resource is not available, can we get the lock?
 	resourceLock, err := r.client.SetNX(ctx, lockID, reqUUID, r.lockTimeout).Result()
 	if err != nil {
-		return "", err
+		res, _, err = generatingFunc()
+		return res, err
 	}
 
 	if resourceLock {
@@ -298,7 +300,8 @@ func (r *RedisMemoLock) getResourceImpl(ctx context.Context, resID string, gener
 	if err != redis.Nil { // key is not missing
 		if err != nil { // real error happened?
 			r.subCh <- unsubRequest
-			return "", err
+			res, _, err = generatingFunc()
+			return res, err
 		}
 		r.subCh <- unsubRequest
 		return res, nil
