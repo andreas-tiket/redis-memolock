@@ -1,11 +1,15 @@
 package memolock
 
 import (
+	"context"
 	"errors"
 	"time"
 
-	"github.com/go-redis/redis"
+	"github.com/dgraph-io/ristretto"
+	"github.com/go-redis/redis/v8"
 	"github.com/gofrs/uuid"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/singleflight"
 )
 
 // FetchFunc is the function that the caller should provide to compute the value if not present in Redis already.
@@ -29,6 +33,8 @@ var ErrLockRenew = errors.New("Unable to renew the lock")
 
 // ErrClosing happens when calling Close(), all pending requests will be failed with this error
 var ErrClosing = errors.New("Operation canceled by Close()")
+
+var localCache *ristretto.Cache
 
 const renewLockLuaScript = `
     if redis.call('GET', KEYS[1]) == ARGV[1]
@@ -54,6 +60,22 @@ type RedisMemoLock struct {
 	subCh         chan subRequest
 	notifCh       <-chan *redis.Message
 	subscriptions map[string][]chan string
+	memoGroup     singleflight.Group
+}
+
+func InitLocalCache(cfg *ristretto.Config) {
+	if cfg == nil {
+		cfg = &ristretto.Config{
+			NumCounters: 1e7,
+			MaxCost:     1 << 30,
+			BufferItems: 64,
+		}
+	}
+	var err error
+	localCache, err = ristretto.NewCache(cfg)
+	if err != nil {
+		logrus.Error("Error When Initialize Local Cache... ERR: ", err)
+	}
 }
 
 func (r *RedisMemoLock) dispatch() {
@@ -103,11 +125,11 @@ func (r *RedisMemoLock) dispatch() {
 }
 
 // NewRedisMemoLock Creates a new RedisMemoLock instance
-func NewRedisMemoLock(client *redis.Client, resourceTag string, lockTimeout time.Duration) (*RedisMemoLock, error) {
+func NewRedisMemoLock(ctx context.Context, client *redis.Client, resourceTag string, lockTimeout time.Duration) (*RedisMemoLock, error) {
 	pattern := resourceTag + "/notif:*"
 
-	pubsub := client.PSubscribe(pattern)
-	_, err := pubsub.Receive()
+	pubsub := client.PSubscribe(ctx, pattern)
+	_, err := pubsub.Receive(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -132,15 +154,46 @@ func (r *RedisMemoLock) Close() {
 	close(r.subCh)
 }
 
-// GetResource tries to get a resource from Redis, resorting to call generatingFunc in case of a cache miss
-func (r *RedisMemoLock) GetResource(resID string, timeout time.Duration, generatingFunc FetchFunc) (string, error) {
-	reqUUID := uuid.Must(uuid.NewV4()).String()
-	return r.getResourceImpl(resID, generatingFunc, timeout, reqUUID, false)
+func (r *RedisMemoLock) GetResource(ctx context.Context, resID string, timeout time.Duration, generatingFunc FetchFunc) (string, error) {
+	key := r.resourceTag + "@" + resID
+	res, found := r.getResourceFromCache(ctx, key)
+	if found {
+		return res, nil
+	}
+
+	v, err, _ := r.memoGroup.Do(resID, func() (interface{}, error) {
+		return r.getResource(ctx, resID, timeout, generatingFunc)
+	})
+
+	res = v.(string)
+	if localCache != nil {
+		localCache.SetWithTTL(key, res, 0, 10*time.Minute)
+	}
+
+	return res, err
 }
 
-func (r *RedisMemoLock) lockRenewFuncGenerator(lockID string, reqUUID string) LockRenewFunc {
+// getResourceFromCache ...
+func (r *RedisMemoLock) getResourceFromCache(ctx context.Context, key string) (string, bool) {
+	if localCache != nil {
+		value, found := localCache.Get(key)
+		if !found {
+			return "", false
+		}
+		return value.(string), found
+	}
+	return "", false
+}
+
+// GetResource tries to get a resource from Redis, resorting to call generatingFunc in case of a cache miss
+func (r *RedisMemoLock) getResource(ctx context.Context, resID string, timeout time.Duration, generatingFunc FetchFunc) (string, error) {
+	reqUUID := uuid.Must(uuid.NewV4()).String()
+	return r.getResourceImpl(ctx, resID, generatingFunc, timeout, reqUUID, false)
+}
+
+func (r *RedisMemoLock) lockRenewFuncGenerator(ctx context.Context, lockID string, reqUUID string) LockRenewFunc {
 	return func(extension time.Duration) error {
-		cmd := r.client.Eval(renewLockLuaScript, []string{lockID}, reqUUID, int(extension))
+		cmd := r.client.Eval(ctx, renewLockLuaScript, []string{lockID}, reqUUID, int(extension))
 		if err := cmd.Err(); err != nil {
 			return err
 		}
@@ -159,48 +212,51 @@ func (r *RedisMemoLock) lockRenewFuncGenerator(lockID string, reqUUID string) Lo
 }
 
 // GetResourceRenewable has the same purpose as GetResource but allows the caller to extend the lock lease during the execution of generatingFunc
-func (r *RedisMemoLock) GetResourceRenewable(resID string, timeout time.Duration, generatingFunc RenewableFetchFunc) (string, error) {
+func (r *RedisMemoLock) GetResourceRenewable(ctx context.Context, resID string, timeout time.Duration, generatingFunc RenewableFetchFunc) (string, error) {
 	reqUUID := uuid.Must(uuid.NewV4()).String()
 	lockID := r.resourceTag + "/lock:" + resID
 
 	// We now prepare a wrapper that injects a lock-extending function
 	// to the one provided by the caller.
 	injectedFunc := func() (string, time.Duration, error) {
-		return generatingFunc(r.lockRenewFuncGenerator(lockID, reqUUID))
+		return generatingFunc(r.lockRenewFuncGenerator(ctx, lockID, reqUUID))
 	}
 
-	return r.getResourceImpl(resID, injectedFunc, timeout, reqUUID, false)
+	return r.getResourceImpl(ctx, resID, injectedFunc, timeout, reqUUID, false)
 }
 
 // GetResourceExternal assumes that the value will be set on Redis and notified on Pub/Sub by another program.
 // Useful for when generatingFunc launches an executable instead of doing the work in the current context.
-func (r *RedisMemoLock) GetResourceExternal(resID string, timeout time.Duration, generatingFunc ExternalFetchFunc) (string, error) {
+func (r *RedisMemoLock) GetResourceExternal(ctx context.Context, resID string, timeout time.Duration, generatingFunc ExternalFetchFunc) (string, error) {
 	reqUUID := uuid.Must(uuid.NewV4()).String()
 	wrappedFunc := func() (string, time.Duration, error) {
 		return "", 0, generatingFunc()
 	}
-	return r.getResourceImpl(resID, wrappedFunc, timeout, reqUUID, true)
+	return r.getResourceImpl(ctx, resID, wrappedFunc, timeout, reqUUID, true)
 }
 
-func (r *RedisMemoLock) getResourceImpl(resID string, generatingFunc FetchFunc, timeout time.Duration, reqUUID string, externallyManaged bool) (string, error) {
+// getResourceImpl ...
+func (r *RedisMemoLock) getResourceImpl(ctx context.Context, resID string, generatingFunc FetchFunc, timeout time.Duration, reqUUID string, externallyManaged bool) (string, error) {
 	resourceID := r.resourceTag + ":" + resID
 	lockID := r.resourceTag + "/lock:" + resID
 	notifID := r.resourceTag + "/notif:" + resID
 
 	// If the resource is available, return it immediately.
-	res, err := r.client.Get(resourceID).Result()
+	res, err := r.client.Get(ctx, resourceID).Result()
 	if err != redis.Nil { // key is not missing
-		if err != nil { // real error happened?
-			return "", err
+		if err != nil { // real error happened? run manual
+			res, _, err = generatingFunc()
+			return res, err
 		}
 		return res, nil
 	}
 	// key is missing
 
 	// The resource is not available, can we get the lock?
-	resourceLock, err := r.client.SetNX(lockID, reqUUID, r.lockTimeout).Result()
+	resourceLock, err := r.client.SetNX(ctx, lockID, reqUUID, r.lockTimeout).Result()
 	if err != nil {
-		return "", err
+		res, _, err = generatingFunc()
+		return res, err
 	}
 
 	if resourceLock {
@@ -214,9 +270,9 @@ func (r *RedisMemoLock) getResourceImpl(resID string, generatingFunc FetchFunc, 
 			// Storage of the token on Redis and notification is handled
 			// by us and we can return the token immediately.
 			pipe := r.client.Pipeline()
-			pipe.Set(resourceID, resourceValue, resourceTTL)
-			pipe.Publish(notifID, resourceValue)
-			_, err := pipe.Exec()
+			pipe.Set(ctx, resourceID, resourceValue, resourceTTL)
+			pipe.Publish(ctx, notifID, resourceValue)
+			_, err := pipe.Exec(ctx)
 			if err != nil {
 				return "", err
 			}
@@ -240,11 +296,12 @@ func (r *RedisMemoLock) getResourceImpl(resID string, generatingFunc FetchFunc, 
 	// Refetch the key in case we missed the pubsub announcement by a hair.
 	// subCh must have no buffering to make sure we do this *after* the sub
 	// really takes effect.
-	res, err = r.client.Get(resourceID).Result()
+	res, err = r.client.Get(ctx, resourceID).Result()
 	if err != redis.Nil { // key is not missing
 		if err != nil { // real error happened?
 			r.subCh <- unsubRequest
-			return "", err
+			res, _, err = generatingFunc()
+			return res, err
 		}
 		r.subCh <- unsubRequest
 		return res, nil
