@@ -34,6 +34,9 @@ var ErrLockRenew = errors.New("Unable to renew the lock")
 // ErrClosing happens when calling Close(), all pending requests will be failed with this error
 var ErrClosing = errors.New("Operation canceled by Close()")
 
+// ErrCacheNotFound happens when cache with certain key not exist
+var ErrCacheNotFound = errors.New("Key not found")
+
 var localCache *ristretto.Cache
 
 const renewLockLuaScript = `
@@ -156,17 +159,24 @@ func (r *RedisMemoLock) Close() {
 
 func (r *RedisMemoLock) GetResource(ctx context.Context, resID string, timeout time.Duration, generatingFunc FetchFunc) (string, error) {
 	key := r.resourceTag + "@" + resID
-	res, found := r.getResourceFromCache(ctx, key)
-	if found {
-		return res, nil
+	v, err, _ := r.memoGroup.Do(key, func() (interface{}, error) {
+		res, found := r.getResourceFromCache(ctx, key)
+		if found {
+			return res, nil
+		}
+		return "", ErrCacheNotFound
+	})
+
+	if err == nil {
+		return v.(string), nil
 	}
 
-	v, err, _ := r.memoGroup.Do(resID, func() (interface{}, error) {
+	v, err, _ = r.memoGroup.Do(resID, func() (interface{}, error) {
 		return r.getResource(ctx, resID, timeout, generatingFunc)
 	})
 
-	res = v.(string)
-	if localCache != nil {
+	res := v.(string)
+	if localCache != nil && err == nil {
 		localCache.SetWithTTL(key, res, 0, 10*time.Minute)
 	}
 
