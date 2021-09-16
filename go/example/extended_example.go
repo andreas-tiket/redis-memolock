@@ -27,6 +27,36 @@ func main() {
 		Addr:    BindAddr,
 	}
 
+	//  count:foo
+	//  count/lock:foo
+	//  count/notif:foo
+	counter := 0
+	countMemolock, _ := memolock.NewRedisMemoLock(r.Context(), r, "count", 10*time.Second)
+
+	// GET counter
+	router.HandleFunc("/counter", func(w http.ResponseWriter, r *http.Request) {
+
+		requestTimeout := 10 * time.Second
+		cachedQueryset, _ := countMemolock.GetResource(r.Context(), "counter", requestTimeout, func() (string, time.Duration, error) {
+			fmt.Printf("(get count %d) Working hard!\n", counter)
+
+			result := fmt.Sprintf("<query set result %d>", counter)
+			// Simulate some hard work like fecthing data from a DBMS
+			<-time.After(2 * time.Second)
+
+			return result, 100 * time.Second, nil
+		})
+
+		fmt.Fprint(w, cachedQueryset)
+	}).Methods("GET")
+
+	// POST counter
+	router.HandleFunc("/counter", func(w http.ResponseWriter, r *http.Request) {
+		counter++
+		countMemolock.InvalidateCache("counter")
+		fmt.Fprint(w, "counter++")
+	}).Methods("POST")
+
 	//  query:foo
 	//  query/lock:foo
 	//  query/notif:foo
