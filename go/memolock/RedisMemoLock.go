@@ -66,6 +66,13 @@ type RedisMemoLock struct {
 	memoGroup     singleflight.Group
 }
 
+type MemoLockConfig struct {
+	NumCounters   int64         `json:"numCounter" default:"1e7"`
+	MaxCost       int64         `json:"maxCost" default:"1<<30"`
+	BufferItems   int64         `json:"bufferItems" default:"64"`
+	LocalCacheTTL time.Duration `json:"localCacheTTL" default:"10m"`
+}
+
 func InitLocalCache(cfg *ristretto.Config) {
 	if cfg == nil {
 		cfg = &ristretto.Config{
@@ -157,6 +164,15 @@ func (r *RedisMemoLock) Close() {
 	close(r.subCh)
 }
 
+func (r *RedisMemoLock) InvalidateCache(key string) {
+	if localCache != nil {
+		localCache.Del(r.resourceTag + "@" + key)
+	}
+
+	r.client.Del(r.client.Context(), r.resourceTag+":"+key)
+	r.client.Del(r.client.Context(), r.resourceTag+"/lock:"+key)
+}
+
 func (r *RedisMemoLock) GetResource(ctx context.Context, resID string, timeout time.Duration, generatingFunc FetchFunc) (string, error) {
 	key := r.resourceTag + "@" + resID
 	v, err, _ := r.memoGroup.Do(key, func() (interface{}, error) {
@@ -188,6 +204,9 @@ func (r *RedisMemoLock) getResourceFromCache(ctx context.Context, key string) (s
 	if localCache != nil {
 		value, found := localCache.Get(key)
 		if !found {
+			return "", false
+		}
+		if value.(string) == "" {
 			return "", false
 		}
 		return value.(string), found
@@ -270,13 +289,39 @@ func (r *RedisMemoLock) getResourceImpl(ctx context.Context, resID string, gener
 	}
 
 	if resourceLock {
-		// We acquired the lock, use the client-provided func to generate the resource.
-		resourceValue, resourceTTL, err := generatingFunc()
-		if err != nil {
-			return "", err
+		var resourceValue string
+		var resourceTTL time.Duration
+		valid := true
+		for valid {
+			// We acquired the lock, use the client-provided func to generate the resource.
+			resourceValue, resourceTTL, err = generatingFunc()
+			if err != nil {
+				return "", err
+			}
+
+			// Retrieve the lock to make sure u have the same lock
+			lock, err := r.client.Get(ctx, lockID).Result()
+			if err == redis.Nil {
+				getLock, err := r.client.SetNX(ctx, lockID, reqUUID, r.lockTimeout).Result()
+				if err != nil {
+					res, _, err = generatingFunc()
+					return res, err
+				}
+				if getLock {
+					continue
+				}
+				valid = false
+			} else if err != nil {
+				res, _, err = generatingFunc()
+				return res, err
+			} else if lock == reqUUID {
+				break
+			} else {
+				valid = false
+			}
 		}
 
-		if !externallyManaged {
+		if !externallyManaged && valid {
 			// Storage of the token on Redis and notification is handled
 			// by us and we can return the token immediately.
 			pipe := r.client.Pipeline()
