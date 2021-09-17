@@ -45,7 +45,7 @@ func main() {
 			<-time.After(2 * time.Second)
 
 			return result, 100 * time.Second, nil
-		})
+		}, 0.8)
 
 		fmt.Fprint(w, cachedQueryset)
 	}).Methods("GET")
@@ -75,7 +75,7 @@ func main() {
 			result := fmt.Sprintf("<query set result %s>", id)
 
 			return result, 5 * time.Second, nil
-		})
+		}, 0.8)
 
 		fmt.Fprint(w, cachedQueryset)
 	})
