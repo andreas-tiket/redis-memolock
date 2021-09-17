@@ -3,6 +3,7 @@ package memolock
 import (
 	"context"
 	"errors"
+	"math/rand"
 	"time"
 
 	"github.com/dgraph-io/ristretto"
@@ -67,10 +68,9 @@ type RedisMemoLock struct {
 }
 
 type MemoLockConfig struct {
-	NumCounters   int64         `json:"numCounter" default:"1e7"`
-	MaxCost       int64         `json:"maxCost" default:"1<<30"`
-	BufferItems   int64         `json:"bufferItems" default:"64"`
-	LocalCacheTTL time.Duration `json:"localCacheTTL" default:"10m"`
+	NumCounters int64 `json:"numCounter" default:"1e4"`
+	MaxCost     int64 `json:"maxCost" default:"1e4"`
+	BufferItems int64 `json:"bufferItems" default:"64"`
 }
 
 func InitLocalCache(cfg *ristretto.Config) {
@@ -164,6 +164,14 @@ func (r *RedisMemoLock) Close() {
 	close(r.subCh)
 }
 
+func getRandomFloatBetween(l, r float64) float64 {
+	return rand.Float64()*(r-l) + l
+}
+
+func jitter(ttl time.Duration) time.Duration {
+	return time.Duration((1.0 + getRandomFloatBetween(-0.1, 0.1)) * float64(ttl.Nanoseconds()))
+}
+
 func (r *RedisMemoLock) InvalidateCache(key string) {
 	if localCache != nil {
 		localCache.Del(r.resourceTag + "@" + key)
@@ -173,7 +181,7 @@ func (r *RedisMemoLock) InvalidateCache(key string) {
 	r.client.Del(r.client.Context(), r.resourceTag+"/lock:"+key)
 }
 
-func (r *RedisMemoLock) GetResource(ctx context.Context, resID string, timeout time.Duration, generatingFunc FetchFunc) (string, error) {
+func (r *RedisMemoLock) GetResource(ctx context.Context, resID string, timeout time.Duration, generatingFunc FetchFunc, localCacheMult float64) (string, error) {
 	key := r.resourceTag + "@" + resID
 	v, err, _ := r.memoGroup.Do(key, func() (interface{}, error) {
 		res, found := r.getResourceFromCache(ctx, key)
@@ -193,7 +201,7 @@ func (r *RedisMemoLock) GetResource(ctx context.Context, resID string, timeout t
 
 	res := v.(string)
 	if localCache != nil && err == nil {
-		localCache.SetWithTTL(key, res, 0, 10*time.Minute)
+		localCache.SetWithTTL(key, res, 0, jitter(time.Duration(localCacheMult*float64(timeout.Nanoseconds()))))
 	}
 
 	return res, err
@@ -295,6 +303,7 @@ func (r *RedisMemoLock) getResourceImpl(ctx context.Context, resID string, gener
 		for valid {
 			// We acquired the lock, use the client-provided func to generate the resource.
 			resourceValue, resourceTTL, err = generatingFunc()
+			resourceTTL = jitter(resourceTTL)
 			if err != nil {
 				return "", err
 			}
