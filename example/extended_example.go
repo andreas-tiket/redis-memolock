@@ -6,9 +6,9 @@ import (
 	"os/exec"
 	"time"
 
+	"github.com/andreas-tiket/redis-memolock/memolock"
 	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/mux"
-	"github.com/kristoff-it/redis-memolock/go/memolock"
 )
 
 // BindAddr contains the address for the HTTP Server to bind to.

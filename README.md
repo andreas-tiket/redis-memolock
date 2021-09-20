@@ -1,120 +1,101 @@
+# Will be adjusted later on...
+
 # Redis MemoLock
-Redis MemoLock - Distributed Caching with Promises 
+This is a Go implementation of MemoLock. 
 
-**[Check out my talk at NDC Oslo 2019 where I showcase the C# implementation of redis-memolock!](https://www.youtube.com/watch?v=BO-SKMS-D_g)**
+## Installation (skip if using Go modules)
+`go get -u github.com/kristoff-it/redis-memolock/go/memolock`
 
-## What is a MemoLock?
+## Documentation
+Available at [the usual place](https://godoc.org/github.com/kristoff-it/redis-memolock/go/memolock).
 
-**A MemoLock is a form of distributed caching with promises. It's like 
-    [memoization](https://en.wikipedia.org/wiki/Memoization), 
-but since the cache is shared by multiple consumers, each key has a locking 
-mechanism that ensures that multiple concurrent requests for the same resource 
-don't cause unnecessary work.**
+## Launching the example
+`go run example/extented_example.go` will launch a HTTP server (default addr: `127.0.0.1:8080`).
 
-While I claim to have come up with the name, the concept is not new (as always), 
-    [here](https://instagram-engineering.com/thundering-herds-promises-82191c8af57d) 
-you can read about Instagram having a similar concept in their architecture, and before them
-many others have approached the subject via r/w-through caches and other methods.
+Use `curl -get localhost:8080/...` to interact with it. 
 
-The implementations in this repository use Redis to cache values and Redis Pub/Sub to resolve
-promises across the network. Since Redis can be replicated and clustered, you can take this 
-library up to any scale.
+The code is fairly self-explanatory.
 
-## Features 
+## Usage
+```go
+package main
 
-### Polyglot
-It works across different languages A client only needs a Redis client library and 
-knowledge of the key naming scheme in use, and is able to generate/resolve promises with any other.
+import (
+    "fmt"
+    "time"
+    "github.com/go-redis/redis"
+    "github.com/kristoff-it/redis-memolock/go/memolock"
+)
 
-### Scalable
-No polling or other wasteful patterns, and it can scale efficiently in a clustered deployment.\
-This is something that Redis is in a unique position to provide.
+func main () {
+    // First, we need a redis connection pool:
+    r := redis.NewClient(&redis.Options{
+        Addr:     "localhost:6379", // use default Addr
+        Password: "",               // no password set
+        DB:       0,                // use default DB
+    })
 
-### Flexible
-It tries to ensure that useless work doesn't happen but, being part of a distributed system, 
-there is no strong guarantee, as it would necessarily require much more coordination and, consequently, 
-lead to lower scalability and lower ease of use.\
-It tries to get a good tradeoff in that regard. *Read more in later sections.*
+    // A memolock instance handles multiple resources of the same type,
+    // all united by the same tag name, which will be then used as a key
+    // prefix in Redis.
+    queryResourceTag := "likes"
 
-## How does it work?
-1. As a service instance, when we need to fetch `likes` for `kristoff` (i.e. `likes:kristoff`), we look for it in Redis.
-    If it's there, we're done.
-2. If the key is not present, we try to acquire `likes/lock:kristoff` using SET with NX.
-    The NX option will ensure that in case of concurrent requests, only one will be able to set the key succesfully.
-3. If we are able to acquire the lock, it means that it's our job to generate the value (e.g. fetch it from DB).
-    Once we're done, we save it to Redis and send a message on a Pub/Sub channel called `likes/notif:kristoff` 
-    to notify all other potentially awaiting clients that the value is now available.
-4. If we were **not** able to acquire the lock, we just subscribe to `likes/notif:kristoff`.
-    The service instance that succeeded in locking the resource to notify us that the value is now available 
-    *(as described in the previous step)*.
+    queryMemoLock, _ := memolock.NewRedisMemoLock(r, queryResourceTag, 5 * time.Second)
+    // This instance has a 5 second default lock timeout.
+    // Later in the code you can use the memolock to cache the result of a function and
+    // make sure that multiple requests don't cause a stampede.
 
-This is a high level description of what redis-memolock does for you.
+    // Here I'm requesting a queryset (saved in Redis as a String) and providing  
+    // a function that can be used if the value needs to be generated:
+    resourceID := "kristoff"
+    requestTimeout := 10 * time.Second
+    cachedQueryset, _ := queryMemoLock.GetResource(resourceID, requestTimeout, 
+        func () (string, time.Duration, error) {
+            fmt.Println("Cache miss!\n")
+            
+            // Sleeping to simulate work. 
+            <- time.After(2 * time.Second)
 
-In practice, to get the concurrency right, there are a few more branches involved, but it has no impact
-on the public interface, so you only have to care about generating the content and handling time-outs.
+            result := fmt.Sprintf(`{"user":"%s", "likes": ["redis"]}`, resourceID)
+            
+            // The function will return a value, a cache time-to-live, and an error.
+            // If the error is not nil, it will be returned to you by GetResource()
+            return result, 5 * time.Second, nil
+        },
+    )
 
-# Repository Contents
-This repository will soon contain a few different implementations that are able to cooperate
-(i.e. can generate and resolve promises one from another). While I aim for all implementations
-to be good enough to work in production (i.e. no concurrency bugs), the main goal is to write
-code that is clear and terse, so that anybody sufficiently motivated can make the right 
-adjustments for their own use-cases.
+    fmt.Println(cachedQueryset)
+    // Launch the script multiple times, see what changes. 
+    // Use redis-cli to see what happens in Redis.
+}
 
-Each implementation has its own README with code examples.
+// MemoLock instances are thread-safe.
 
-### C#
-[See `csharp/redis-memolock`](csharp/redis-memolock).
+```
+If you launch two instances of this program within 5 seconds, you will see that "Cache miss!" is 
+going to show only once, regardless of whether the first execution has already concluded 
+(i.e. the value was cached) or if it's still computing (sleeping instead of doing useful 
+work, in the case of this sample code).
 
-Inside the `csharp` directory you will find a ASP.NET Core WebApi project containing usage examples and a MemoLock implementation that uses a `System.Concurrent.Dictionary` with `TaskCompletionSource` (manually triggered Tasks) to handle concurrency.
+## Features
+This library also supports:
+- Renewing the lock lease: `GetResourceRenewable()`
+- Triggering an external application that will report the result via Reids: `GetResourceExternal()`
 
-### Go
-[See `go/README.md`](go/).
-
-Inside the `go/` directory you can find a Go module. This implementation makes good use of 
-goroutines and channels, and uses a single goroutine to write to the subscription multiplexer,
-as opposed to the C# version which has concurrent writers acquire control of a `ConcurrentDictionary`.
+Read `example/extended_example.go` for more details.
 
 
-## !! WARNING !!
-This library is all about nimble locking for enhancing performance. It's ok to use it in combination
-with external systems (e.g. store the result of the computation elsewhere, like a CDN if it's a PDF
-report, and just save in Redis a token representing the location) but it's **NOT** ok to use it to 
-lock computations that rely on mutual exclusion for correctness. **This locking mechanism is about 
-doing less work, not correct work.** 
+## Is this library production-ready?
+Yes, feel free to import this Go module in your code, 
+but know that it was created to showcase the possibilities of using Redis Pub/Sub
+in a caching scenario. Your needs might be different enough to warrant different
+tradeoffs compared to what I chose for this implementation.
 
-A **good example** is locking database reads: two reads at the same time won't cause any problem
-and the last writer will win.
+Go and Redis make the details of this library extraordinarily clear (and concise, 270LOC).
+If you need to make serious use of it, read the code and try to understand where
+it might be improved for your specific use-case. A trivial example is the fact that
+I'm using Redis Strings to cache results, while you might want a more appropriate data
+structure, like a Hash, Set, Sorted Set, Geospatial Index, or even a probabilistic
+data structure such as HyperLogLog. 
 
-A **not-so-good example** is trying to upload a file to an FTP server (or CDN) with a non-unique name: 
-what happens if two writers try to write to the same filename?\
-*Answer: in reasonable implementations one writer will fail and report an error.*\
-*Fix: make sure filenames generated by different writers can't collide (e.g. use UUIDs), or catch the 
-error if you can distinguish it from other types of error (i.e. you get a FileAlreadyExistsError, and 
-not a GenericOpenError).*
-
-A **bad example** is using a MemoLock to guard a computation that might be corrupted by concurrent
-writers. If your mistake is bad enough, you might end up in a situation where both writes succeed
-and the result becomes corrupted. Don't use this lock to do distributed transactions, for example.\
-*Fix: just don't.*
-
-I'm writing this warning because distributed locking is a complex subject and it's easy to misuse
-tools if you expect from them greater guarantees than they actually provide. As stated previously,
-this library tries to be lightweight to enhance performance, not guarantee full mutual exclusion.
-While not providing such functionality can be seen as a limitation, the upside is that such library
-would not be able scale as much (because of a higher level of coordination) and would not allow you
-to use services that are not Redis-aware to store results, such as a CDN, for example.
-
-*Enjoy the simplicity and flexibility that springs from limiting the scope of our design.*
-
-## How can different implementations share promises?
-Here the term *promise* is used in a fairly abstract way with only a small connection to any specific language implementation.
-Different implementations can interoperate because they share a Redis client and the understanding of three concepts:
-
-1. Keys are stored using the scheme `<resource tag>:<resource id>`\
-   (e.g. `likes:kristoff`)
-2. Locks are stored using the scheme`<resource tag>/lock:<resource id>`\
-   (e.g. `likes/lock:kristoff`)
-3. Pub/Sub notifications are sent over the channel `<resource tag>/notif:<resource id>`\
-   (e.g. `likes/notif:kristoff`)
-
-Any client that can `SET` and `GET` a key, and that can use Pub/Sub, can interoperate transparently with all others.
+Checkout https://redis.io to see all the supported data types.

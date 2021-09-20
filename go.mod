@@ -1,4 +1,4 @@
-module github.com/andreas-tiket/redis-memolock/go
+module github.com/andreas-tiket/redis-memolock
 
 go 1.12
 
