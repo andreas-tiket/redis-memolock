@@ -4,7 +4,7 @@
 This is a Go implementation of MemoLock. 
 
 ## Installation (skip if using Go modules)
-`go get -u github.com/kristoff-it/redis-memolock/go/memolock`
+`go get -u github.com/andreas-tiket/redis-memolock/memolock`
 
 ## Documentation
 Available at [the usual place](https://godoc.org/github.com/kristoff-it/redis-memolock/go/memolock).
@@ -24,7 +24,7 @@ import (
     "fmt"
     "time"
     "github.com/go-redis/redis"
-    "github.com/kristoff-it/redis-memolock/go/memolock"
+    "github.com/andreas-tiket/redis-memolock/memolock"
 )
 
 func main () {
