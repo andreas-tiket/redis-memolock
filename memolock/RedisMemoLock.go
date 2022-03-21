@@ -181,7 +181,7 @@ func (r *RedisMemoLock) InvalidateCache(key string) {
 	r.client.Del(r.client.Context(), r.resourceTag+"/lock:"+key)
 }
 
-func (r *RedisMemoLock) GetResource(ctx context.Context, resID string, timeout time.Duration, generatingFunc FetchFunc, localCacheMult float64) (string, error) {
+func (r *RedisMemoLock) GetResource(ctx context.Context, resID string, timeout time.Duration, generatingFunc FetchFunc, localCacheMult float64) (string, bool, error) {
 	key := r.resourceTag + "@" + resID
 	v, err, _ := r.memoGroup.Do(key, func() (interface{}, error) {
 		res, found := r.getResourceFromCache(ctx, key)
@@ -192,7 +192,7 @@ func (r *RedisMemoLock) GetResource(ctx context.Context, resID string, timeout t
 	})
 
 	if err == nil {
-		return v.(string), nil
+		return v.(string), true, nil
 	}
 
 	v, err, _ = r.memoGroup.Do(resID, func() (interface{}, error) {
@@ -204,7 +204,7 @@ func (r *RedisMemoLock) GetResource(ctx context.Context, resID string, timeout t
 		localCache.SetWithTTL(key, res, 0, jitter(time.Duration(localCacheMult*float64(timeout.Nanoseconds()))))
 	}
 
-	return res, err
+	return res, false, err
 }
 
 // getResourceFromCache ...

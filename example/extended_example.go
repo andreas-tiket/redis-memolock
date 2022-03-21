@@ -37,7 +37,7 @@ func main() {
 	router.HandleFunc("/counter", func(w http.ResponseWriter, r *http.Request) {
 
 		requestTimeout := 10 * time.Second
-		cachedQueryset, _ := countMemolock.GetResource(r.Context(), "counter", requestTimeout, func() (string, time.Duration, error) {
+		cachedQueryset, _, _ := countMemolock.GetResource(r.Context(), "counter", requestTimeout, func() (string, time.Duration, error) {
 			fmt.Printf("(get count %d) Working hard!\n", counter)
 
 			result := fmt.Sprintf("<query set result %d>", counter)
@@ -67,7 +67,7 @@ func main() {
 		id := mux.Vars(r)["id"] // extract {id} from the url path
 
 		requestTimeout := 10 * time.Second
-		cachedQueryset, _ := queryMemolock.GetResource(r.Context(), id, requestTimeout, func() (string, time.Duration, error) {
+		cachedQueryset, _, _ := queryMemolock.GetResource(r.Context(), id, requestTimeout, func() (string, time.Duration, error) {
 			fmt.Printf("(query/queryset/%s) Working hard!\n", id)
 
 			// Simulate some hard work like fecthing data from a DBMS
